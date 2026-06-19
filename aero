@@ -1,0 +1,885 @@
+#!/usr/bin/python3
+"""Aero — Dynamic Island AI asszisztens"""
+
+import ctypes
+ctypes.CDLL("/usr/lib/libgtk4-layer-shell.so", ctypes.RTLD_GLOBAL)
+
+import sys
+sys.path.insert(0, "/home/ddnemet/.local/share/ai-assistant/venv/lib/python3.14/site-packages")
+
+import gi
+gi.require_version('Gtk', '4.0')
+gi.require_version('Gtk4LayerShell', '1.0')
+from gi.repository import Gtk, GLib, Gdk, Gtk4LayerShell, Pango
+
+import os, json, threading, configparser, imaplib, email, smtplib, datetime, cairo, subprocess, signal, tempfile, random
+from email.header import decode_header
+from email.mime.text import MIMEText
+from groq import Groq
+
+# ══════════════════════════════════════════════════════════
+#  KINÉZET — IDE SZERKESZD
+# ══════════════════════════════════════════════════════════
+
+RADIUS          = 20        # Sarok lekerekítés (px)
+ISLAND_W_IDLE   = 420      # Notch szélessége alapállapotban (px)
+ISLAND_W_OPEN   = 1000      # Szélesség nyitva (px)
+ISLAND_H        = 44        # Notch magassága (px)
+ANIM_MS         = 10        # Animáció lépése ms-ben
+ANIM_STEP       = 40        # Szélesség változás lépésenként (px)
+
+BG              = "#000000" # Háttérszín
+BORDER_COLOR    = "#1e1540" # Keret szín
+ACCENT          = "#7c6ff7" # Hangsúly szín (logo, kurzor, gondolkozás)
+TEXT_INPUT      = "#ffffff" # Beviteli szöveg színe
+TEXT_RESPONSE   = "#c8beff" # Válasz szöveg színe
+TEXT_LOGO       = "#FFFFFF" # "AERO" szöveg színe
+TEXT_PLACEHOLDER= "#383838" # Placeholder szöveg
+
+FONT_SIZE_LOGO  = 13        # Logo betűméret
+FONT_SIZE_INPUT = 16        # Bevitel betűméret
+FONT_SIZE_RESP  = 15        # Válasz betűméret
+
+# ══════════════════════════════════════════════════════════
+#  CONFIG
+# ══════════════════════════════════════════════════════════
+
+CFG_FILE      = os.path.expanduser("~/.config/ai-assistant/config")
+DATA_DIR      = os.path.expanduser("~/.local/share/ai-assistant")
+TASKS_FILE    = os.path.join(DATA_DIR, "tasks.json")
+HISTORY_FILE  = os.path.join(DATA_DIR, "history.json")
+MEMORY_ANON   = 10 * 60   # 10 perc ha nincs API kulcs
+MEMORY_TURNS  = 20        # max ennyi turn kerül a kontextusba
+
+cfg = configparser.ConfigParser()
+cfg.read(CFG_FILE)
+GROQ_KEY   = cfg.get("main",  "groq_api_key",  fallback="")
+GMAIL_USER = cfg.get("gmail", "email",          fallback="")
+GMAIL_PASS = cfg.get("gmail", "app_password",   fallback="")
+
+groq_client = Groq(api_key=GROQ_KEY)
+MODEL = "llama-3.3-70b-versatile"
+
+# ══════════════════════════════════════════════════════════
+#  MEMÓRIA / HISTORY
+# ══════════════════════════════════════════════════════════
+
+def _load_history():
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    try:
+        with open(HISTORY_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return []
+
+def _save_history(h):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(h[-500:], f, ensure_ascii=False, indent=2)
+
+def append_history(user_text: str, ai_response: str):
+    h = _load_history()
+    h.append({"ts": datetime.datetime.now().timestamp(),
+               "user": user_text, "ai": ai_response})
+    _save_history(h)
+
+def get_context_history() -> list:
+    h = _load_history()
+    if not h:
+        return []
+    now = datetime.datetime.now().timestamp()
+    if GROQ_KEY:
+        recent = h[-MEMORY_TURNS:]
+    else:
+        cutoff = now - MEMORY_ANON
+        recent = [x for x in h if x["ts"] > cutoff][-MEMORY_TURNS:]
+    msgs = []
+    for item in recent:
+        msgs.append({"role": "user",      "content": item["user"]})
+        msgs.append({"role": "assistant", "content": item["ai"]})
+    return msgs
+
+def search_history(query: str) -> str:
+    h = _load_history()
+    ql = query.lower()
+    hits = [x for x in h if ql in x["user"].lower() or ql in x["ai"].lower()]
+    if not hits:
+        return "Nincs találat."
+    lines = []
+    for x in hits[-10:]:
+        dt = datetime.datetime.fromtimestamp(x["ts"]).strftime("%m.%d %H:%M")
+        lines.append(f"[{dt}] Te: {x['user'][:70]}\n       AI: {x['ai'][:100]}")
+    return "\n─────\n".join(lines)
+
+# ══════════════════════════════════════════════════════════
+#  TOOLS
+# ══════════════════════════════════════════════════════════
+
+def get_recent_emails(count: int = 3) -> str:
+    if not GMAIL_USER or not GMAIL_PASS:
+        return "Gmail nincs beállítva."
+    try:
+        mail = imaplib.IMAP4_SSL("imap.gmail.com")
+        mail.login(GMAIL_USER, GMAIL_PASS)
+        mail.select("INBOX")
+        _, data = mail.search(None, "ALL")
+        ids = data[0].split()[-count:]
+        results = []
+        for eid in reversed(ids):
+            _, msg_data = mail.fetch(eid, "(RFC822)")
+            msg = email.message_from_bytes(msg_data[0][1])
+            raw = decode_header(msg["Subject"])[0]
+            subject = raw[0]
+            if isinstance(subject, bytes):
+                subject = subject.decode(raw[1] or "utf-8", errors="replace")
+            body = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == "text/plain":
+                        body = part.get_payload(decode=True).decode(errors="replace")[:300]
+                        break
+            else:
+                body = msg.get_payload(decode=True).decode(errors="replace")[:300]
+            results.append(f"Feladó: {msg['From']}\nTárgy: {subject}\n{body.strip()}")
+        mail.logout()
+        return "\n---\n".join(results)
+    except Exception as e:
+        return f"Gmail hiba: {e}"
+
+_pending_email: dict = {}
+
+def request_send_email(to: str, subject: str, body: str) -> str:
+    _pending_email.update({"to": to, "subject": subject, "body": body})
+    return "__CONFIRM_EMAIL__"
+
+def _do_send_email(to, subject, body) -> str:
+    if not GMAIL_USER or not GMAIL_PASS:
+        return "Gmail nincs beállítva."
+    try:
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["From"] = GMAIL_USER; msg["To"] = to; msg["Subject"] = subject
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+            s.login(GMAIL_USER, GMAIL_PASS); s.send_message(msg)
+        return f"Email elküldve: {to}"
+    except Exception as e:
+        return f"Küldési hiba: {e}"
+
+def _load_tasks():
+    if not os.path.exists(TASKS_FILE): return []
+    with open(TASKS_FILE, encoding="utf-8") as f: return json.load(f)
+
+def _save_tasks(t):
+    with open(TASKS_FILE, "w", encoding="utf-8") as f: json.dump(t, f, ensure_ascii=False, indent=2)
+
+def create_task(title: str, notes: str = "") -> str:
+    t = _load_tasks()
+    t.append({"id": len(t)+1, "title": title, "notes": notes,
+               "created": datetime.datetime.now().isoformat(), "done": False})
+    _save_tasks(t); return f"Feladat hozzáadva: {title}"
+
+def list_tasks() -> str:
+    t = _load_tasks()
+    p = [x for x in t if not x.get("done")]
+    return "Nincs feladat." if not p else "\n".join(
+        f"[{x['id']}] {x['title']}" + (f" — {x['notes']}" if x.get("notes") else "") for x in p)
+
+def open_url(url: str) -> str:
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    subprocess.Popen(["xdg-open", url])
+    return f"Megnyitva: {url}"
+
+def launch_app(app: str) -> str:
+    try:
+        subprocess.Popen([app], start_new_session=True)
+        return f"Elindítva: {app}"
+    except FileNotFoundError:
+        # próbálj keresni más névvel
+        try:
+            subprocess.Popen(["bash", "-c", f"{app} &"], start_new_session=True)
+            return f"Elindítva: {app}"
+        except Exception as e:
+            return f"Nem találom: {app} ({e})"
+
+def run_command(command: str) -> str:
+    needs_sudo = "sudo" in command or command.strip().startswith(("pacman", "yay", "paru"))
+    if needs_sudo:
+        # sudo kell → nyiss terminált ahol be lehet írni a jelszót
+        safe = command.replace("'", "'\\''")
+        launched = False
+        for term in ["kitty", "alacritty", "foot", "wezterm", "xterm"]:
+            try:
+                subprocess.Popen([term, "-e", "bash", "-c",
+                    f"{safe}; echo; echo '--- Kész, nyomj Entert ---'; read"])
+                launched = True
+                break
+            except FileNotFoundError:
+                continue
+        if launched:
+            return f"Terminálban futtatom (add meg a jelszót ott):\n$ {command}"
+        else:
+            return f"Nincs elérhető terminál. Futtasd kézzel:\n$ {command}"
+    try:
+        r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=20)
+        out = (r.stdout + r.stderr).strip()
+        return out[:800] if out else "Kész."
+    except subprocess.TimeoutExpired:
+        return "Időtúllépés (20s)."
+    except Exception as e:
+        return f"Hiba: {e}"
+
+def complete_task(task_id: int) -> str:
+    t = _load_tasks()
+    for x in t:
+        if x.get("id") == task_id:
+            x["done"] = True; _save_tasks(t); return f"Kész: {x['title']}"
+    return f"Nem találom: #{task_id}"
+
+TOOLS = [
+    {"type":"function","function":{"name":"get_recent_emails",
+        "description":"Emailek/2FA kódok olvasása. CSAK ha emailről/gmailről/kódról kérdeznek.",
+        "parameters":{"type":"object","properties":{"count":{"type":"integer"}}}}},
+    {"type":"function","function":{"name":"request_send_email",
+        "description":"Email küldése. CSAK ha: 'írj emailt', 'küldj emailt' hangzik el.",
+        "parameters":{"type":"object","properties":{
+            "to":{"type":"string"},"subject":{"type":"string"},"body":{"type":"string"}},
+            "required":["to","subject","body"]}}},
+    {"type":"function","function":{"name":"create_task",
+        "description":"Feladat hozzáadása. CSAK ha: 'ird be a listába', 'feladat', 'add hozzá'.",
+        "parameters":{"type":"object","properties":{
+            "title":{"type":"string"},"notes":{"type":"string"}},"required":["title"]}}},
+    {"type":"function","function":{"name":"list_tasks",
+        "description":"Feladatlista lekérése.",
+        "parameters":{"type":"object","properties":{}}}},
+    {"type":"function","function":{"name":"complete_task",
+        "description":"Feladat befejezése.",
+        "parameters":{"type":"object","properties":{"task_id":{"type":"integer"}},"required":["task_id"]}}},
+    {"type":"function","function":{"name":"open_url",
+        "description":"URL / weboldal megnyitása böngészőben. Használd ha: 'nyisd meg', 'youtube', 'google', 'menj erre az oldalra', bármilyen weboldal neve elhangzik.",
+        "parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
+    {"type":"function","function":{"name":"launch_app",
+        "description":"Alkalmazás indítása. Használd ha: 'indítsd el', 'nyisd meg a ...t', app neve hangzik el (pl. spotify, discord, thunar, code, gimp).",
+        "parameters":{"type":"object","properties":{"app":{"type":"string","description":"Az alkalmazás parancsneve, pl. 'firefox', 'spotify', 'code', 'thunar'"}},"required":["app"]}}},
+    {"type":"function","function":{"name":"run_command",
+        "description":"Terminál parancs futtatása és kimenet visszaadása. Használd ha: 'futtasd', 'terminálban', rendszerinfó kell, fájlok listázása, ping, stb.",
+        "parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}},
+]
+TOOL_MAP = {"get_recent_emails": get_recent_emails, "request_send_email": request_send_email,
+            "create_task": create_task, "list_tasks": list_tasks, "complete_task": complete_task,
+            "open_url": open_url, "launch_app": launch_app, "run_command": run_command}
+
+SYSTEM = """Te egy személyes AI asszisztens vagy Arch Linuxon. Hyprland ablakkezelő fut.
+
+KRITIKUS SZABÁLY: Ha a felhasználó azt kéri hogy CSINÁLJ valamit (telepíts, tölts le, futtass, nyiss meg, stb.) — MINDIG hívj eszközt. SOHA ne mondd hogy "Kész" vagy "Megtettem" anélkül hogy ténylegesen meghívtad volna a megfelelő eszközt. Ha nem hívtál eszközt, nem csináltál semmit.
+
+ESZKÖZÖK — mikor kötelező használni:
+- run_command: telepítés ("sudo pacman -S ..."), letöltés, rendszerparancsok, driver telepítés, bármi ami terminált igényel. KÖTELEZŐ ha: "telepítsd", "töltsd le", "frissítsd", "futtasd", "install", "update"
+- open_url: weboldal megnyitása böngészőben
+- launch_app: alkalmazás indítása
+- get_recent_emails / request_send_email: email műveletek
+- create_task / list_tasks / complete_task: feladatlista
+
+PÉLDÁK amikhez run_command KÖTELEZŐ:
+- "telepítsd az nvidia drivert" → run_command("sudo pacman -S nvidia nvidia-utils")
+- "frissítsd a rendszert" → run_command("sudo pacman -Syu")
+- "mennyi hely van" → run_command("df -h")
+
+Mindig magyarul. Ha eszközt hívtál és sikerült: egy sor eredmény. Ha nem tudod futtatni (pl. sudo jelszó kell): mondd el őszintén."""
+
+def run_agent(user_input: str) -> str:
+    messages = [{"role":"system","content":SYSTEM}]
+    messages.extend(get_context_history())
+    messages.append({"role":"user","content":user_input})
+    for _ in range(6):
+        resp = groq_client.chat.completions.create(
+            model=MODEL, messages=messages, tools=TOOLS, tool_choice="auto")
+        msg = resp.choices[0].message
+        messages.append({"role":"assistant","content":msg.content or "",
+                         "tool_calls":[
+                             {"id":tc.id,"type":"function","function":{"name":tc.function.name,"arguments":tc.function.arguments}}
+                             for tc in (msg.tool_calls or [])
+                         ]})
+        if not msg.tool_calls:
+            return msg.content or "Nincs válasz."
+        for tc in msg.tool_calls:
+            fn = TOOL_MAP.get(tc.function.name)
+            args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+            if not isinstance(args, dict): args = {}
+            result = fn(**args) if fn else f"Ismeretlen: {tc.function.name}"
+            if result == "__CONFIRM_EMAIL__":
+                return "__CONFIRM_EMAIL__"
+            messages.append({"role":"tool","tool_call_id":tc.id,"content":result})
+    return "Hiba."
+
+# ══════════════════════════════════════════════════════════
+#  CSS
+# ══════════════════════════════════════════════════════════
+
+def make_css():
+    return f"""
+window {{
+    background-color: transparent;
+}}
+
+.wrapper {{
+    background-color: transparent;
+    min-height: {ISLAND_H + 4}px;
+}}
+
+.island {{
+    background-color: {BG};
+    border-radius: 0 0 {RADIUS}px {RADIUS}px;  /* csak az alső sarkok kerekek */
+    padding: 0 16px;
+    min-height: {ISLAND_H}px;
+}}
+
+.logo-label {{
+    font-size: {FONT_SIZE_LOGO}px;
+    font-weight: bold;
+    color: {TEXT_LOGO};
+    letter-spacing: 3px;
+}}
+
+.sep {{
+    background-color: {BORDER_COLOR};
+    min-width: 1px;
+    min-height: 16px;
+    margin: 0 12px;
+}}
+
+.input {{
+    font-size: {FONT_SIZE_INPUT}px;
+    color: {TEXT_INPUT};
+    caret-color: {ACCENT};
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    padding: 0;
+    min-width: 200px;
+}}
+.input:focus {{ outline: none; box-shadow: none; }}
+entry.input {{ background: transparent; }}
+entry.input > text {{ background: transparent; }}
+.input placeholder {{ color: {TEXT_PLACEHOLDER}; }}
+
+.response {{
+    font-size: {FONT_SIZE_RESP}px;
+    color: {TEXT_RESPONSE};
+}}
+
+.response:hover {{
+    color: white;
+}}
+
+.thinking {{
+    font-size: {FONT_SIZE_RESP}px;
+    color: {ACCENT};
+}}
+
+.detail-panel {{
+    background-color: {BG};
+}}
+
+/* Teljes valasz ablak */
+.full-window {{
+    background-color: #0a0a0a;
+    border-radius: 16px;
+    border: 1px solid {BORDER_COLOR};
+    padding: 24px;
+}}
+
+.full-title {{
+    font-size: 11px;
+    font-weight: bold;
+    color: {ACCENT};
+    letter-spacing: 2px;
+    margin-bottom: 12px;
+}}
+
+.full-text {{
+    font-size: 14px;
+    color: #e0d8ff;
+    line-height: 1.6;
+}}
+""".encode()
+
+# ══════════════════════════════════════════════════════════
+#  FULL RESPONSE WINDOW
+# ══════════════════════════════════════════════════════════
+
+class FullWindow(Gtk.Window):
+    def __init__(self, text: str):
+        super().__init__()
+        self.set_title("Aero ai")
+        self.set_decorated(False)
+        self.set_default_size(680, 400)
+        self.set_resizable(True)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.add_css_class("full-window")
+        self.set_child(outer)
+
+        title = Gtk.Label(label="AERO")
+        title.set_halign(Gtk.Align.START)
+        title.add_css_class("full-title")
+        outer.append(title)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_vexpand(True)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        outer.append(scroll)
+
+        label = Gtk.Label(label=text)
+        label.set_wrap(True)
+        label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        label.set_halign(Gtk.Align.START)
+        label.set_valign(Gtk.Align.START)
+        label.set_selectable(True)
+        label.add_css_class("full-text")
+        scroll.set_child(label)
+
+        kc = Gtk.EventControllerKey()
+        kc.connect("key-pressed", lambda c, k, *a: self.close() if k == Gdk.KEY_Escape else False)
+        self.add_controller(kc)
+        self.present()
+
+        self.present()
+
+# ══════════════════════════════════════════════════════════
+#  ISLAND WINDOW
+# ══════════════════════════════════════════════════════════
+
+class IslandWindow(Gtk.ApplicationWindow):
+
+    def __init__(self, app):
+        super().__init__(application=app)
+        self.set_decorated(False)
+        self.set_resizable(False)
+
+        Gtk4LayerShell.init_for_window(self)
+        Gtk4LayerShell.set_layer(self, Gtk4LayerShell.Layer.OVERLAY)
+        Gtk4LayerShell.set_anchor(self, Gtk4LayerShell.Edge.TOP, True)
+        Gtk4LayerShell.set_exclusive_zone(self, -1)
+        Gtk4LayerShell.set_keyboard_mode(self, Gtk4LayerShell.KeyboardMode.NONE)
+
+        self.set_default_size(ISLAND_W_IDLE, ISLAND_H)
+        self.set_size_request(ISLAND_W_IDLE, ISLAND_H)
+
+        self._w          = ISLAND_W_IDLE
+        self._target_w   = ISLAND_W_IDLE
+        self._anim       = None
+        self._think_tmr  = None
+        self._dots       = 0
+        self._full_text  = ""
+        self._open             = False
+        self._awaiting_confirm = False
+        self._last_query       = ""
+        self._recording        = False
+        self._rec_proc         = None
+        self._rec_file         = None
+        self._wave_bars        = [0.3] * 7
+        self._wave_tmr         = None
+
+        self._build_ui()
+        self._apply_css()
+        signal.signal(signal.SIGUSR1, lambda s, f: GLib.idle_add(self._toggle_dictation))
+
+    def _build_ui(self):
+        # Vertikális island: felső sor (pill) + lenyíló detail panel
+        self._island = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._island.add_css_class("island")
+        self._island.set_hexpand(True)
+        self.set_child(self._island)
+
+        # ── Felső sor (a pill maga) ──────────────────────────
+        top_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        top_row.set_size_request(-1, ISLAND_H)
+        self._island.append(top_row)
+
+        self._logo = Gtk.Label(label="")
+        self._logo.add_css_class("logo-label")
+        self._logo.set_size_request(ISLAND_W_IDLE - 20, -1)
+        top_row.append(self._logo)
+
+        self._wave_area = Gtk.DrawingArea()
+        self._wave_area.set_size_request(ISLAND_W_IDLE - 20, ISLAND_H)
+        self._wave_area.set_draw_func(self._draw_wave)
+        self._wave_area.set_visible(False)
+        top_row.append(self._wave_area)
+
+        self._content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self._content.set_visible(False)
+        self._content.set_hexpand(True)
+        top_row.append(self._content)
+
+        sep = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        sep.add_css_class("sep")
+        self._content.append(sep)
+
+        self._entry = Gtk.Entry()
+        self._entry.set_placeholder_text("Kérdezz valamit...")
+        self._entry.set_hexpand(True)
+        self._entry.add_css_class("input")
+        self._entry.connect("activate", self._on_submit)
+        Gtk.Settings.get_default().set_property("gtk-entry-select-on-focus", False)
+        kc = Gtk.EventControllerKey()
+        kc.connect("key-pressed", self._on_key)
+        self._entry.add_controller(kc)
+        self._content.append(self._entry)
+
+        self._resp = Gtk.Label(label="")
+        self._resp.set_halign(Gtk.Align.START)
+        self._resp.set_ellipsize(Pango.EllipsizeMode.END)
+        self._resp.set_max_width_chars(50)
+        self._resp.add_css_class("response")
+        self._resp.set_visible(False)
+        self._resp.set_cursor(Gdk.Cursor.new_from_name("pointer"))
+        self._content.append(self._resp)
+
+        click = Gtk.GestureClick()
+        click.connect("released", self._on_resp_click)
+        self._resp.add_controller(click)
+
+        logo_click = Gtk.GestureClick()
+        logo_click.connect("released", self._on_logo_click)
+        self._logo.add_controller(logo_click)
+
+        # ── Detail panel (lenyíló, alapból rejtett) ──────────
+        self._detail = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._detail.add_css_class("detail-panel")
+        self._detail.set_visible(False)
+
+        sep2 = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        sep2.add_css_class("sep")
+        self._detail.append(sep2)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_size_request(-1, 220)
+        self._detail.append(scroll)
+
+        self._detail_label = Gtk.Label(label="")
+        self._detail_label.set_wrap(True)
+        self._detail_label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self._detail_label.set_halign(Gtk.Align.START)
+        self._detail_label.set_valign(Gtk.Align.START)
+        self._detail_label.set_selectable(True)
+        self._detail_label.add_css_class("full-text")
+        self._detail_label.set_margin_start(16)
+        self._detail_label.set_margin_end(16)
+        self._detail_label.set_margin_top(10)
+        self._detail_label.set_margin_bottom(10)
+        scroll.set_child(self._detail_label)
+
+        self._island.append(self._detail)
+        self._expanded = False
+
+    def _apply_css(self):
+        p = Gtk.CssProvider()
+        p.load_from_data(make_css())
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), p,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    # ── Animáció ──────────────────────────────────────────
+
+    def _update_input_region(self, island_w):
+        surf = self.get_surface()
+        if surf is None:
+            return
+        x = (self._screen_w - island_w) // 2
+        region = cairo.Region(cairo.RectangleInt(x, 0, island_w, ISLAND_H + 8))
+        surf.set_input_region(region)
+
+    def _set_width(self, w):
+        self._w = w
+        self.set_size_request(w, ISLAND_H)
+        self._island.set_size_request(w, ISLAND_H)
+
+    def _animate_to(self, target):
+        self._target_w = target
+        if self._anim:
+            GLib.source_remove(self._anim)
+        self._anim = GLib.timeout_add(ANIM_MS, self._anim_tick)
+
+    def _anim_tick(self):
+        diff = self._target_w - self._w
+        if abs(diff) <= ANIM_STEP:
+            self._set_width(self._target_w)
+            self._anim = None
+            return False
+        self._set_width(self._w + (ANIM_STEP if diff > 0 else -ANIM_STEP))
+        return True
+
+    # ── Állapotok ─────────────────────────────────────────
+
+    def open_input(self):
+        if self._open: return
+        self._open = True
+        Gtk4LayerShell.set_keyboard_mode(self, Gtk4LayerShell.KeyboardMode.EXCLUSIVE)
+        self._resp.set_visible(False)
+        self._entry.set_visible(True)
+        self._content.set_visible(True)
+        self._logo.set_label("AERO")
+        self._animate_to(ISLAND_W_OPEN)
+        GLib.timeout_add(150, self._entry.grab_focus)
+
+    def close_input(self):
+        self._open = False
+        Gtk4LayerShell.set_keyboard_mode(self, Gtk4LayerShell.KeyboardMode.NONE)
+        self._stop_thinking()
+        self._content.set_visible(False)
+        self._logo.set_label("")
+        self._detail.set_visible(False)
+        self._expanded = False
+        self._animate_to(ISLAND_W_IDLE)
+
+    def _start_thinking(self):
+        self._entry.set_visible(False)
+        self._resp.remove_css_class("response")
+        self._resp.add_css_class("thinking")
+        self._resp.set_text("···")
+        self._resp.set_visible(True)
+        self._dots = 0
+        if not self._think_tmr:
+            self._think_tmr = GLib.timeout_add(350, self._tick)
+
+    def _tick(self):
+        frames = ["·  ", "·· ", "···", " ··", "  ·", " ··"]
+        self._dots = (self._dots + 1) % len(frames)
+        self._resp.set_text(frames[self._dots])
+        return True
+
+    def _stop_thinking(self):
+        if self._think_tmr:
+            GLib.source_remove(self._think_tmr)
+            self._think_tmr = None
+
+    # ── Events ────────────────────────────────────────────
+
+    def _on_logo_click(self, gesture, n, x, y):
+        if self._open:
+            self.close_input()
+        else:
+            self.open_input()
+
+    def _on_key(self, ctrl, keyval, *_):
+        if keyval == Gdk.KEY_Escape:
+            if self._awaiting_confirm:
+                self._on_confirm_no()
+            else:
+                self.close_input()
+        return False
+
+    def _on_submit(self, entry):
+        if self._awaiting_confirm:
+            self._on_confirm_yes()
+            return
+        text = entry.get_text().strip()
+        if not text: return
+        entry.set_text("")
+        if text.startswith("/load"):
+            query = text[5:].strip()
+            result = search_history(query) if query else "Használat: /load <keresett szó>"
+            self._show_response(result)
+            return
+        entry.set_sensitive(False)
+        self._last_query = text
+        self._start_thinking()
+        threading.Thread(target=self._ask, args=(text,), daemon=True).start()
+
+    def _ask(self, text):
+        import time
+        for attempt in range(3):
+            try:
+                result = run_agent(text)
+                break
+            except Exception as e:
+                msg = str(e)
+                if "503" in msg and attempt < 2:
+                    time.sleep(2)
+                    continue
+                result = "A Groq szerver túlterhelt (503), próbáld újra." if "503" in msg else f"Hiba: {e}"
+                break
+        if result == "__CONFIRM_EMAIL__":
+            GLib.idle_add(self._confirm_email)
+        else:
+            GLib.idle_add(self._show_response, result)
+
+    def _show_response(self, text):
+        self._stop_thinking()
+        self._full_text = text
+        self._resp.remove_css_class("thinking")
+        self._resp.add_css_class("response")
+        self._resp.set_text(text)
+        self._resp.set_visible(True)
+        self._entry.set_sensitive(True)
+        self._entry.set_visible(True)
+        if self._last_query and not text.startswith("Nincs találat") and not text.startswith("Használat"):
+            append_history(self._last_query, text)
+            self._last_query = ""
+
+    def _on_resp_click(self, gesture, n, x, y):
+        if not self._full_text:
+            return
+        if self._expanded:
+            self._detail.set_visible(False)
+            self._expanded = False
+            self.set_size_request(self._w, ISLAND_H)
+        else:
+            self._detail_label.set_text(self._full_text)
+            self._detail.set_visible(True)
+            self._expanded = True
+            self.set_size_request(self._w, ISLAND_H + 240)
+
+    def _confirm_email(self):
+        self._stop_thinking()
+        em = _pending_email
+        self._entry.set_text("")
+        self._entry.set_placeholder_text(f"Küldöm? → {em.get('to','?')}  [Enter=igen / Esc=nem]")
+        self._entry.set_sensitive(True)
+        self._entry.set_visible(True)
+        self._resp.set_visible(False)
+        self._awaiting_confirm = True
+        GLib.timeout_add(150, self._entry.grab_focus)
+
+    def _on_confirm_yes(self):
+        self._awaiting_confirm = False
+        self._entry.set_placeholder_text("Kérdezz valamit...")
+        em = _pending_email.copy(); _pending_email.clear()
+        self._entry.set_text("")
+        self._start_thinking()
+        threading.Thread(target=lambda: GLib.idle_add(
+            self._show_response, _do_send_email(em["to"], em["subject"], em["body"])
+        ), daemon=True).start()
+
+    def _on_confirm_no(self):
+        self._awaiting_confirm = False
+        self._entry.set_placeholder_text("Kérdezz valamit...")
+        _pending_email.clear()
+        self._show_response("Email megszakítva.")
+
+    # ── Diktálás ──────────────────────────────────────────────
+
+    def _toggle_dictation(self):
+        if self._recording:
+            self._stop_dictation()
+        else:
+            self._start_dictation()
+
+    def _start_dictation(self):
+        self._recording = True
+        if not self._open:
+            self._open = True
+            Gtk4LayerShell.set_keyboard_mode(self, Gtk4LayerShell.KeyboardMode.EXCLUSIVE)
+            self._animate_to(ISLAND_W_OPEN)
+        self._logo.set_visible(False)
+        self._wave_area.set_visible(True)
+        self._content.set_visible(False)
+        self._wave_tmr = GLib.timeout_add(80, self._animate_wave)
+        self._rec_file = tempfile.mktemp(suffix=".wav")
+        for cmd in [
+            ["pw-record", "--rate=16000", "--channels=1", self._rec_file],
+            ["arecord", "-f", "S16_LE", "-r", "16000", "-c", "1", self._rec_file],
+        ]:
+            try:
+                self._rec_proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
+                break
+            except FileNotFoundError:
+                continue
+
+    def _stop_dictation(self):
+        self._recording = False
+        if self._rec_proc:
+            self._rec_proc.terminate()
+            self._rec_proc.wait()
+            self._rec_proc = None
+        if self._wave_tmr:
+            GLib.source_remove(self._wave_tmr)
+            self._wave_tmr = None
+        self._wave_area.set_visible(False)
+        self._logo.set_visible(True)
+        self._logo.set_label("AERO")
+        self._content.set_visible(True)
+        self._entry.set_sensitive(False)
+        self._entry.set_placeholder_text("Átírom...")
+        self._resp.set_visible(False)
+        self._entry.set_visible(True)
+        threading.Thread(target=self._transcribe, args=(self._rec_file,), daemon=True).start()
+
+    def _transcribe(self, filepath):
+        try:
+            import time; time.sleep(0.3)
+            with open(filepath, "rb") as f:
+                result = groq_client.audio.transcriptions.create(
+                    file=(os.path.basename(filepath), f),
+                    model="whisper-large-v3-turbo",
+                    language="hu",
+                )
+            text = result.text.strip()
+        except Exception as e:
+            text = ""
+        finally:
+            try: os.unlink(filepath)
+            except: pass
+        GLib.idle_add(self._set_dictated_text, text)
+
+    def _set_dictated_text(self, text):
+        self._entry.set_sensitive(True)
+        self._entry.set_placeholder_text("Kérdezz valamit...")
+        if text:
+            self._entry.set_text(text)
+            self._entry.grab_focus()
+            self._entry.set_position(-1)
+
+    def _draw_wave(self, area, cr, width, height):
+        bar_w, gap = 4, 4
+        n = len(self._wave_bars)
+        total_w = n * bar_w + (n - 1) * gap
+        x0 = (width - total_w) / 2
+        r, g, b = 0.49, 0.44, 0.97  # ACCENT
+        for i, h in enumerate(self._wave_bars):
+            bar_h = max(4, int(h * (height - 8)))
+            x = x0 + i * (bar_w + gap)
+            y = (height - bar_h) / 2
+            cr.set_source_rgba(r, g, b, 0.6 + h * 0.4)
+            cr.rectangle(x, y, bar_w, bar_h)
+            cr.fill()
+
+    def _animate_wave(self):
+        if not self._recording:
+            return False
+        self._wave_bars = [
+            max(0.05, min(1.0, b + random.uniform(-0.35, 0.35)))
+            for b in self._wave_bars
+        ]
+        self._wave_area.queue_draw()
+        return True
+
+    def focus(self):
+        if self._open:
+            self.close_input()
+        else:
+            self.open_input()
+
+# ══════════════════════════════════════════════════════════
+#  APP
+# ══════════════════════════════════════════════════════════
+
+class AeroApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="com.aero.assistant")
+        self._win = None
+
+    def do_activate(self):
+        if self._win is None:
+            self._win = IslandWindow(self)
+            self._win.present()
+        else:
+            self._win.present()
+            self._win.focus()
+
+if __name__ == "__main__":
+    app = AeroApp()
+    app.run(sys.argv)
